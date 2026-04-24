@@ -1,21 +1,11 @@
+import type { ExecutionContext } from "@cloudflare/workers-types";
+
 interface Env {
   UPSTREAM_BASE_URL?: string;
   ALLOWED_ORIGIN?: string;
 }
 
-interface ModelCard {
-  id: string;
-  object?: string;
-  created?: number;
-  owned_by?: string;
-  [key: string]: unknown;
-}
-
-interface ModelListResponse {
-  object: string;
-  data: ModelCard[];
-  [key: string]: unknown;
-}
+// ========== Chat Completions types (upstream / DeepSeek) ==========
 
 interface ChatCompletionsRequest {
   model: string;
@@ -32,14 +22,14 @@ interface ChatCompletionsRequest {
   tools?: ChatTool[];
   tool_choice?: unknown;
   reasoning_effort?: string;
+  response_format?: unknown;
+  stop?: string | string[];
   service_tier?: string;
-  functions?: ChatFunction[];
-  function_call?: unknown;
 }
 
 interface ChatMessage {
   role: string;
-  content?: unknown;
+  content?: string | ChatContentPart[] | null;
   reasoning_content?: string;
   name?: string;
   tool_calls?: ChatToolCall[];
@@ -54,9 +44,7 @@ interface ChatContentTextPart {
 
 interface ChatContentImagePart {
   type: "image_url" | "input_image";
-  image_url?: {
-    url?: string;
-  } | string;
+  image_url?: { url?: string } | string;
 }
 
 interface ChatContentReasoningPart {
@@ -108,7 +96,7 @@ interface ChatChoice {
   index: number;
   message: {
     role: "assistant";
-    content?: string;
+    content?: string | null;
     reasoning_content?: string;
     tool_calls?: ChatToolCall[];
   };
@@ -119,9 +107,7 @@ interface ChatUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
-  prompt_tokens_details?: {
-    cached_tokens?: number;
-  };
+  prompt_tokens_details?: { cached_tokens?: number };
 }
 
 interface ChatCompletionsChunk {
@@ -137,12 +123,14 @@ interface ChatChunkChoice {
   index: number;
   delta: {
     role?: "assistant";
-    content?: string;
+    content?: string | null;
     reasoning_content?: string;
     tool_calls?: ChatToolCall[];
   };
   finish_reason: string | null;
 }
+
+// ========== Responses types (client-facing) ==========
 
 interface ResponsesRequest {
   model: string;
@@ -150,16 +138,17 @@ interface ResponsesRequest {
   max_output_tokens?: number;
   temperature?: number;
   top_p?: number;
-  stream: true;
+  stream?: boolean;
   tools?: ResponsesTool[];
   include?: string[];
   store?: boolean;
   reasoning?: {
-    effort: string;
+    effort?: string;
     summary?: string;
   };
   tool_choice?: unknown;
   service_tier?: string;
+  instructions?: string;
 }
 
 interface ResponsesInputItem {
@@ -193,13 +182,8 @@ interface ResponsesResponse {
   status: string;
   output: ResponsesOutput[];
   usage?: ResponsesUsage;
-  incomplete_details?: {
-    reason?: string;
-  };
-  error?: {
-    code?: string;
-    message?: string;
-  };
+  incomplete_details?: { reason?: string };
+  error?: { code?: string; message?: string };
 }
 
 interface ResponsesOutput {
@@ -211,19 +195,14 @@ interface ResponsesOutput {
   call_id?: string;
   name?: string;
   arguments?: string;
-  summary?: Array<{
-    type?: string;
-    text?: string;
-  }>;
+  summary?: Array<{ type?: string; text?: string }>;
 }
 
 interface ResponsesUsage {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
-  input_tokens_details?: {
-    cached_tokens?: number;
-  };
+  input_tokens_details?: { cached_tokens?: number };
 }
 
 interface ResponsesStreamEvent {
@@ -244,29 +223,29 @@ interface ResponsesStreamEvent {
   sequence_number?: number;
 }
 
-interface ChatStreamState {
+// ========== Stream state ==========
+
+interface ChatToResponsesStreamState {
   id: string;
   model: string;
   created: number;
-  sentRole: boolean;
-  sawToolCall: boolean;
+  sentCreated: boolean;
+  messageOutputIndex: number;
+  nextOutputIndex: number;
+  chatToolIndexToOutputIndex: Map<number, number>;
   finalized: boolean;
-  nextToolCallIndex: number;
-  outputIndexToToolIndex: Map<number, number>;
-  includeUsage: boolean;
-  usage?: ChatUsage;
   contentText: string;
   reasoningText: string;
-  toolCalls: Array<{
-    id?: string;
-    name?: string;
-    arguments: string;
-  }>;
-  finishReason: string;
+  toolCalls: Array<{ id?: string; name?: string; arguments: string }>;
+  usage?: ChatUsage;
 }
 
-const DEFAULT_UPSTREAM_BASE_URL = "";
+// ========== Constants ==========
+
+const DEFAULT_UPSTREAM_BASE_URL = "https://api.deepseek.com";
 const encoder = new TextEncoder();
+
+// ========== Fetch handler ==========
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -281,8 +260,8 @@ export default {
         return withCors(
           jsonResponse({
             ok: true,
-            name: "hypergryph-openai-compat-proxy",
-            endpoints: ["/v1/models", "/v1/chat/completions"]
+            name: "responses2deepseek-proxy",
+            endpoints: ["/v1/models", "/v1/chat/completions", "/v1/responses"]
           }),
           request,
           env
@@ -301,6 +280,10 @@ export default {
         return withCors(await handleChatCompletions(request, env, ctx), request, env);
       }
 
+      if (request.method === "POST" && url.pathname === "/v1/responses") {
+        return withCors(await handleResponses(request, env, ctx), request, env);
+      }
+
       return withCors(
         openAIErrorResponse(404, "invalid_request_error", "Endpoint not found"),
         request,
@@ -313,6 +296,8 @@ export default {
   }
 };
 
+// ========== Handlers ==========
+
 async function handleModels(request: Request, env: Env): Promise<Response> {
   let upstreamResponse: Response;
   try {
@@ -320,9 +305,8 @@ async function handleModels(request: Request, env: Env): Promise<Response> {
       method: "GET",
       headers: buildUpstreamHeaders(request)
     });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Failed to reach upstream models endpoint";
-    return openAIErrorResponse(502, "api_error", message);
+  } catch {
+    return openAIErrorResponse(502, "api_error", "Failed to reach upstream models endpoint");
   }
 
   if (!upstreamResponse.ok) {
@@ -333,21 +317,16 @@ async function handleModels(request: Request, env: Env): Promise<Response> {
   if (!contentType.includes("application/json")) {
     return new Response(upstreamResponse.body, {
       status: upstreamResponse.status,
-      headers: {
-        "content-type": contentType || "application/octet-stream"
-      }
+      headers: { "content-type": contentType || "application/octet-stream" }
     });
   }
 
-  const upstreamJson = (await upstreamResponse.json()) as ModelListResponse;
+  const upstreamJson = await upstreamResponse.json();
   return jsonResponse(upstreamJson);
 }
 
-async function handleChatCompletions(
-  request: Request,
-  env: Env,
-  ctx: ExecutionContext
-): Promise<Response> {
+// Direct pass-through to upstream Chat Completions (no conversion)
+async function handleChatCompletions(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   let body: unknown;
   try {
     body = await request.json();
@@ -359,37 +338,15 @@ async function handleChatCompletions(
     return openAIErrorResponse(400, "invalid_request_error", "Request body must be an object");
   }
 
-  const chatRequest = body as ChatCompletionsRequest;
-  if (!chatRequest.model || typeof chatRequest.model !== "string") {
-    return openAIErrorResponse(400, "invalid_request_error", "model is required");
-  }
-  if (!Array.isArray(chatRequest.messages) || chatRequest.messages.length === 0) {
-    return openAIErrorResponse(400, "invalid_request_error", "messages must be a non-empty array");
-  }
-  if (typeof chatRequest.n === "number" && chatRequest.n !== 1) {
-    return openAIErrorResponse(400, "invalid_request_error", "Only n=1 is supported");
-  }
-
-  const requestedModel = chatRequest.model;
-
-  let responsesRequest: ResponsesRequest;
-  try {
-    responsesRequest = chatCompletionsToResponses(chatRequest, requestedModel);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Failed to map request";
-    return openAIErrorResponse(400, "invalid_request_error", message);
-  }
-
   let upstreamResponse: Response;
   try {
-    upstreamResponse = await fetch(joinUrl(getUpstreamBaseUrl(env), "/v1/responses"), {
+    upstreamResponse = await fetch(joinUrl(getUpstreamBaseUrl(env), "/v1/chat/completions"), {
       method: "POST",
       headers: buildUpstreamHeaders(request),
-      body: JSON.stringify(responsesRequest)
+      body: JSON.stringify(body)
     });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Failed to reach upstream responses endpoint";
-    return openAIErrorResponse(502, "api_error", message);
+  } catch {
+    return openAIErrorResponse(502, "api_error", "Failed to reach upstream chat/completions endpoint");
   }
 
   if (!upstreamResponse.ok) {
@@ -397,534 +354,488 @@ async function handleChatCompletions(
   }
 
   const contentType = upstreamResponse.headers.get("content-type") ?? "";
-  if (chatRequest.stream) {
+
+  if (contentType.includes("text/event-stream")) {
+    return new Response(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache",
+        connection: "keep-alive"
+      }
+    });
+  }
+
+  const data = await upstreamResponse.json();
+  return jsonResponse(data);
+}
+
+// Responses API → Chat Completions → DeepSeek
+async function handleResponses(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return openAIErrorResponse(400, "invalid_request_error", "Request body must be valid JSON");
+  }
+
+  if (!isRecord(body)) {
+    return openAIErrorResponse(400, "invalid_request_error", "Request body must be an object");
+  }
+
+  const responsesRequest = body as unknown as ResponsesRequest;
+  if (!responsesRequest.model || typeof responsesRequest.model !== "string") {
+    return openAIErrorResponse(400, "invalid_request_error", "model is required");
+  }
+  if (!Array.isArray(responsesRequest.input) || responsesRequest.input.length === 0) {
+    return openAIErrorResponse(400, "invalid_request_error", "input must be a non-empty array");
+  }
+
+  let chatRequest: ChatCompletionsRequest;
+  try {
+    chatRequest = responsesToChatCompletionsRequest(responsesRequest);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to map request";
+    return openAIErrorResponse(400, "invalid_request_error", message);
+  }
+
+  // Always request streaming from upstream so we have a single code path
+  chatRequest.stream = true;
+  chatRequest.stream_options = { include_usage: true };
+
+  let upstreamResponse: Response;
+  try {
+    upstreamResponse = await fetch(joinUrl(getUpstreamBaseUrl(env), "/v1/chat/completions"), {
+      method: "POST",
+      headers: buildUpstreamHeaders(request),
+      body: JSON.stringify(chatRequest)
+    });
+  } catch {
+    return openAIErrorResponse(502, "api_error", "Failed to reach upstream chat/completions endpoint");
+  }
+
+  if (!upstreamResponse.ok) {
+    return convertUpstreamErrorResponse(upstreamResponse);
+  }
+
+  const contentType = upstreamResponse.headers.get("content-type") ?? "";
+
+  if (responsesRequest.stream) {
     if (!upstreamResponse.body) {
       return openAIErrorResponse(502, "api_error", "Upstream stream body is empty");
     }
-    return streamResponsesToChat(upstreamResponse.body, requestedModel, chatRequest, ctx);
+    return streamChatToResponses(upstreamResponse.body, responsesRequest.model, ctx);
   }
 
+  // Non-streaming: collect the upstream stream, build a single response
   if (contentType.includes("application/json")) {
-    const responseJson = (await upstreamResponse.json()) as ResponsesResponse;
-    return jsonResponse(responsesToChatCompletions(responseJson, requestedModel));
+    const chatJson = (await upstreamResponse.json()) as ChatCompletionsResponse;
+    return jsonResponse(chatCompletionToResponsesResponse(chatJson, responsesRequest.model));
   }
 
   if (!upstreamResponse.body) {
     return openAIErrorResponse(502, "api_error", "Upstream response body is empty");
   }
 
-  const completion = await collectChatCompletionFromStream(
-    upstreamResponse.body,
-    requestedModel,
-    Boolean(chatRequest.stream_options?.include_usage)
-  );
-  return jsonResponse(completion);
+  const responsesJson = await collectResponsesFromChatStream(upstreamResponse.body, responsesRequest.model);
+  return jsonResponse(responsesJson);
 }
 
-function chatCompletionsToResponses(
-  request: ChatCompletionsRequest,
-  upstreamModel: string
-): ResponsesRequest {
-  const input = convertChatMessagesToResponsesInput(request.messages);
-  const out: ResponsesRequest = {
-    model: upstreamModel,
-    input,
-    stream: true,
-    store: false,
-    include: ["reasoning.encrypted_content"]
+// ========== Request conversion: Responses → Chat Completions ==========
+
+function responsesToChatCompletionsRequest(req: ResponsesRequest): ChatCompletionsRequest {
+  const out: ChatCompletionsRequest = {
+    model: req.model,
+    messages: convertResponsesInputToChatMessages(req.input)
   };
 
-  if (typeof request.max_completion_tokens === "number") {
-    out.max_output_tokens = request.max_completion_tokens;
-  } else if (typeof request.max_tokens === "number") {
-    out.max_output_tokens = request.max_tokens;
+  if (typeof req.max_output_tokens === "number") {
+    out.max_tokens = req.max_output_tokens;
   }
-  if (typeof request.temperature === "number") {
-    out.temperature = request.temperature;
+  if (typeof req.temperature === "number") {
+    out.temperature = req.temperature;
   }
-  if (typeof request.top_p === "number") {
-    out.top_p = request.top_p;
+  if (typeof req.top_p === "number") {
+    out.top_p = req.top_p;
   }
-  if (request.reasoning_effort) {
-    out.reasoning = {
-      effort: request.reasoning_effort,
-      summary: "auto"
-    };
+  if (req.reasoning?.effort) {
+    out.reasoning_effort = req.reasoning.effort;
   }
-  if (request.service_tier) {
-    out.service_tier = request.service_tier;
+  if (req.service_tier) {
+    out.service_tier = req.service_tier;
   }
 
-  const tools = convertChatTools(request.tools, request.functions);
+  // Merge system instructions into messages
+  if (req.instructions) {
+    out.messages.unshift({ role: "system", content: req.instructions });
+  }
+
+  const tools = convertResponsesTools(req.tools);
   if (tools.length > 0) {
     out.tools = tools;
   }
-  if (request.tool_choice !== undefined) {
-    out.tool_choice = request.tool_choice;
-  } else if (request.function_call !== undefined) {
-    out.tool_choice = request.function_call;
+  if (req.tool_choice !== undefined) {
+    out.tool_choice = req.tool_choice;
   }
 
   return out;
 }
 
-function convertChatMessagesToResponsesInput(messages: ChatMessage[]): ResponsesInputItem[] {
-  const items: ResponsesInputItem[] = [];
+function convertResponsesInputToChatMessages(input: ResponsesInputItem[]): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+  let pendingAssistant: ChatMessage | null = null;
 
-  for (const message of messages) {
-    switch (message.role) {
-      case "system":
-      case "user":
-        items.push({
-          role: message.role,
-          content: convertUserFacingContent(message.content)
-        });
-        break;
-      case "assistant":
-        items.push(...convertAssistantMessage(message));
-        break;
-      case "tool":
-        items.push({
-          type: "function_call_output",
-          call_id: message.tool_call_id || message.name || crypto.randomUUID(),
-          output: coerceText(message.content)
-        });
-        break;
-      case "function":
-        items.push({
-          type: "function_call_output",
-          call_id: message.name || crypto.randomUUID(),
-          output: coerceText(message.content)
-        });
-        break;
-      default:
-        items.push({
-          role: "user",
-          content: convertUserFacingContent(message.content)
-        });
-        break;
-    }
-  }
-
-  return items;
-}
-
-function convertAssistantMessage(message: ChatMessage): ResponsesInputItem[] {
-  const items: ResponsesInputItem[] = [];
-  const assistantText = coerceAssistantText(message);
-
-  if (assistantText) {
-    items.push({
-      role: "assistant",
-      content: [
-        {
-          type: "output_text",
-          text: assistantText
-        }
-      ]
-    });
-  }
-
-  const toolCalls = [...(message.tool_calls ?? [])];
-  if (message.function_call) {
-    toolCalls.push({
-      id: message.name || crypto.randomUUID(),
-      type: "function",
-      function: message.function_call
-    });
-  }
-
-  for (const toolCall of toolCalls) {
-    items.push({
-      type: "function_call",
-      call_id: toolCall.id || crypto.randomUUID(),
-      name: toolCall.function?.name || "unknown_function",
-      arguments: toolCall.function?.arguments || "{}"
-    });
-  }
-
-  return items;
-}
-
-function convertUserFacingContent(content: unknown): string | ResponsesContentPart[] {
-  if (typeof content === "string") {
-    return content;
-  }
-
-  if (!Array.isArray(content)) {
-    return coerceText(content);
-  }
-
-  const parts: ResponsesContentPart[] = [];
-  for (const part of content as ChatContentPart[]) {
-    if (!isRecord(part) || typeof part.type !== "string") {
-      continue;
-    }
-
-    if (
-      (part.type === "text" || part.type === "input_text") &&
-      typeof part.text === "string"
-    ) {
-      parts.push({
-        type: "input_text",
-        text: part.text
-      });
-      continue;
-    }
-
-    if (part.type === "image_url" || part.type === "input_image") {
-      const imageUrl = extractImageUrl(part.image_url);
-      if (imageUrl) {
-        parts.push({
-          type: "input_image",
-          image_url: imageUrl
-        });
+  function flushAssistant() {
+    if (pendingAssistant) {
+      if (!pendingAssistant.content && (pendingAssistant.tool_calls?.length ?? 0) === 0) {
+        pendingAssistant.content = "";
       }
+      messages.push(pendingAssistant);
+      pendingAssistant = null;
     }
   }
 
-  return parts.length > 0 ? parts : coerceText(content);
-}
-
-function convertChatTools(tools?: ChatTool[], functions?: ChatFunction[]): ResponsesTool[] {
-  const out: ResponsesTool[] = [];
-
-  for (const tool of tools ?? []) {
-    if (tool.type !== "function" || !tool.function?.name) {
-      continue;
-    }
-    out.push({
-      type: "function",
-      name: tool.function.name,
-      description: tool.function.description,
-      parameters: tool.function.parameters,
-      strict: tool.function.strict
-    });
-  }
-
-  for (const func of functions ?? []) {
-    if (!func.name) {
-      continue;
-    }
-    out.push({
-      type: "function",
-      name: func.name,
-      description: func.description,
-      parameters: func.parameters,
-      strict: func.strict
-    });
-  }
-
-  return out;
-}
-
-function responsesToChatCompletions(
-  response: ResponsesResponse,
-  requestedModel: string
-): ChatCompletionsResponse {
-  let content = "";
-  let reasoningContent = "";
-  const toolCalls: ChatToolCall[] = [];
-
-  for (const item of response.output ?? []) {
-    if (item.type === "message") {
-      for (const part of item.content ?? []) {
-        if (part.type === "output_text" && part.text) {
-          content += part.text;
-        }
+  for (const item of input) {
+    if (item.role === "system") {
+      flushAssistant();
+      messages.push({ role: "system", content: coerceInputContent(item.content) });
+    } else if (item.role === "user") {
+      flushAssistant();
+      messages.push({ role: "user", content: coerceInputContent(item.content) });
+    } else if (item.role === "assistant") {
+      if (!pendingAssistant) {
+        pendingAssistant = { role: "assistant", content: "", tool_calls: [] };
       }
-      continue;
-    }
-
-    if (item.type === "function_call") {
-      toolCalls.push({
-        id: item.call_id,
+      const text = extractTextFromContent(item.content);
+      if (text) {
+        pendingAssistant.content = (pendingAssistant.content || "") + text;
+      }
+    } else if (item.type === "function_call") {
+      if (!pendingAssistant) {
+        pendingAssistant = { role: "assistant", content: "", tool_calls: [] };
+      }
+      (pendingAssistant.tool_calls ??= []).push({
+        id: item.call_id || generateId("call"),
         type: "function",
         function: {
           name: item.name,
           arguments: item.arguments ?? "{}"
         }
       });
-      continue;
+    } else if (item.type === "function_call_output") {
+      flushAssistant();
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id || "",
+        content: item.output ?? ""
+      });
     }
+  }
 
-    if (item.type === "reasoning") {
-      for (const summary of item.summary ?? []) {
-        if (summary.type === "summary_text" && summary.text) {
-          reasoningContent += summary.text;
-        }
+  flushAssistant();
+  return messages;
+}
+
+function convertResponsesTools(tools?: ResponsesTool[]): ChatTool[] {
+  const out: ChatTool[] = [];
+  for (const t of tools ?? []) {
+    if (t.type !== "function" || !t.name) continue;
+    out.push({
+      type: "function",
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters,
+        strict: t.strict
       }
-    }
+    });
   }
+  return out;
+}
 
-  const message: ChatChoice["message"] = {
-    role: "assistant"
-  };
-  if (content) {
-    message.content = content;
-  }
-  if (reasoningContent) {
-    message.reasoning_content = reasoningContent;
-  }
-  if (toolCalls.length > 0) {
-    message.tool_calls = toolCalls;
+// ========== Response conversion: Chat Completions → Responses (non-streaming) ==========
+
+function chatCompletionToResponsesResponse(
+  completion: ChatCompletionsResponse,
+  requestedModel: string
+): ResponsesResponse {
+  const output: ResponsesOutput[] = [];
+  const choice = completion.choices?.[0];
+
+  if (choice) {
+    // Reasoning content
+    if (choice.message.reasoning_content) {
+      output.push({
+        type: "reasoning",
+        summary: [{
+          type: "summary_text",
+          text: choice.message.reasoning_content
+        }]
+      });
+    }
+
+    // Text content
+    if (choice.message.content) {
+      output.push({
+        type: "message",
+        role: "assistant",
+        content: [{
+          type: "output_text",
+          text: choice.message.content
+        }]
+      });
+    }
+
+    // Tool calls
+    for (const tc of choice.message.tool_calls ?? []) {
+      output.push({
+        type: "function_call",
+        call_id: tc.id,
+        name: tc.function?.name,
+        arguments: tc.function?.arguments ?? "{}"
+      });
+    }
   }
 
   return {
-    id: response.id || generateChatCompletionId(),
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
+    id: completion.id || generateId("resp"),
+    object: "response",
     model: requestedModel,
-    choices: [
-      {
-        index: 0,
-        message,
-        finish_reason: responsesStatusToFinishReason(
-          response.status,
-          response.incomplete_details?.reason,
-          toolCalls.length > 0
-        )
-      }
-    ],
-    usage: response.usage ? mapUsage(response.usage) : undefined
+    status: finishReasonToStatus(choice?.finish_reason ?? "stop"),
+    output,
+    usage: completion.usage ? mapChatUsageToResponsesUsage(completion.usage) : undefined
   };
 }
 
-function createStreamState(model: string, includeUsage: boolean): ChatStreamState {
+// ========== Response conversion: Chat SSE → Responses SSE (streaming) ==========
+
+function createResponsesStreamState(model: string): ChatToResponsesStreamState {
   return {
-    id: generateChatCompletionId(),
+    id: generateId("resp"),
     model,
     created: Math.floor(Date.now() / 1000),
-    sentRole: false,
-    sawToolCall: false,
+    sentCreated: false,
+    messageOutputIndex: -1,
+    nextOutputIndex: 0,
+    chatToolIndexToOutputIndex: new Map(),
     finalized: false,
-    nextToolCallIndex: 0,
-    outputIndexToToolIndex: new Map<number, number>(),
-    includeUsage,
     contentText: "",
     reasoningText: "",
-    toolCalls: [],
-    finishReason: "stop"
+    toolCalls: []
   };
 }
 
-function convertResponsesEventToChatChunks(
-  event: ResponsesStreamEvent,
-  state: ChatStreamState
-): ChatCompletionsChunk[] {
-  switch (event.type) {
-    case "response.created":
-      if (event.response?.id) {
-        state.id = event.response.id;
-      }
-      return ensureRoleChunk(state);
-    case "response.output_text.delta":
-      return handleTextDelta(event, state);
-    case "response.output_item.added":
-      return handleOutputItemAdded(event, state);
-    case "response.function_call_arguments.delta":
-      return handleFunctionArgumentsDelta(event, state);
-    case "response.reasoning_summary_text.delta":
-      return handleReasoningDelta(event, state);
-    case "response.completed":
-    case "response.incomplete":
-    case "response.failed":
-      return handleCompletedEvent(event, state);
-    default:
-      return [];
-  }
-}
-
-function ensureRoleChunk(state: ChatStreamState): ChatCompletionsChunk[] {
-  if (state.sentRole) {
-    return [];
-  }
-  state.sentRole = true;
-  return [makeDeltaChunk(state, { role: "assistant" })];
-}
-
-function handleTextDelta(
-  event: ResponsesStreamEvent,
-  state: ChatStreamState
-): ChatCompletionsChunk[] {
-  if (!event.delta) {
-    return [];
-  }
-  state.contentText += event.delta;
-  return [...ensureRoleChunk(state), makeDeltaChunk(state, { content: event.delta })];
-}
-
-function handleOutputItemAdded(
-  event: ResponsesStreamEvent,
-  state: ChatStreamState
-): ChatCompletionsChunk[] {
-  if (event.item?.type !== "function_call") {
+function convertChatChunkToResponsesEvents(
+  chunk: ChatCompletionsChunk,
+  state: ChatToResponsesStreamState
+): ResponsesStreamEvent[] {
+  const choice = chunk.choices?.[0];
+  if (!choice) {
+    // Usage-only chunk (when stream_options.include_usage is set)
+    if (chunk.usage) {
+      state.usage = chunk.usage;
+    }
     return [];
   }
 
-  state.sawToolCall = true;
-  const toolIndex = state.nextToolCallIndex++;
-  const outputIndex = typeof event.output_index === "number" ? event.output_index : toolIndex;
-  state.outputIndexToToolIndex.set(outputIndex, toolIndex);
-  state.toolCalls[toolIndex] = {
-    id: event.item.call_id,
-    name: event.item.name,
-    arguments: ""
-  };
+  const events: ResponsesStreamEvent[] = [];
 
-  return [
-    ...ensureRoleChunk(state),
-    makeDeltaChunk(state, {
-      tool_calls: [
-        {
-          index: toolIndex,
-          id: event.item.call_id,
-          type: "function",
-          function: {
-            name: event.item.name,
-            arguments: ""
-          }
-        }
-      ]
-    })
-  ];
-}
-
-function handleFunctionArgumentsDelta(
-  event: ResponsesStreamEvent,
-  state: ChatStreamState
-): ChatCompletionsChunk[] {
-  if (!event.delta || typeof event.output_index !== "number") {
-    return [];
+  // Ensure response.created is sent first
+  if (!state.sentCreated) {
+    state.sentCreated = true;
+    state.id = chunk.id || state.id;
+    state.model = chunk.model || state.model;
+    state.created = chunk.created || state.created;
+    events.push(makeCreatedEvent(state));
   }
 
-  const toolIndex = state.outputIndexToToolIndex.get(event.output_index);
-  if (toolIndex === undefined) {
-    return [];
-  }
+  // Text content
+  if (choice.delta?.content) {
+    const delta = choice.delta.content;
+    state.contentText += delta;
 
-  state.toolCalls[toolIndex] = state.toolCalls[toolIndex] ?? {
-    id: event.call_id,
-    name: event.name,
-    arguments: ""
-  };
-  state.toolCalls[toolIndex].arguments += event.delta;
+    if (state.messageOutputIndex === -1) {
+      state.messageOutputIndex = state.nextOutputIndex++;
+      events.push(makeMessageItemAddedEvent(state.messageOutputIndex));
+    }
 
-  return [
-    makeDeltaChunk(state, {
-      tool_calls: [
-        {
-          index: toolIndex,
-          function: {
-            arguments: event.delta
-          }
-        }
-      ]
-    })
-  ];
-}
-
-function handleReasoningDelta(
-  event: ResponsesStreamEvent,
-  state: ChatStreamState
-): ChatCompletionsChunk[] {
-  if (!event.delta) {
-    return [];
-  }
-  state.reasoningText += event.delta;
-  return [
-    ...ensureRoleChunk(state),
-    makeDeltaChunk(state, {
-      reasoning_content: event.delta
-    })
-  ];
-}
-
-function handleCompletedEvent(
-  event: ResponsesStreamEvent,
-  state: ChatStreamState
-): ChatCompletionsChunk[] {
-  if (state.finalized) {
-    return [];
-  }
-
-  state.finalized = true;
-  state.finishReason = "stop";
-
-  if (event.response?.usage) {
-    state.usage = mapUsage(event.response.usage);
-  }
-
-  if (event.response) {
-    state.finishReason = responsesStatusToFinishReason(
-      event.response.status,
-      event.response.incomplete_details?.reason,
-      state.sawToolCall
-    );
-  } else if (state.sawToolCall) {
-    state.finishReason = "tool_calls";
-  }
-
-  const chunks: ChatCompletionsChunk[] = [makeFinishChunk(state, state.finishReason)];
-  if (state.includeUsage && state.usage) {
-    chunks.push({
-      id: state.id,
-      object: "chat.completion.chunk",
-      created: state.created,
-      model: state.model,
-      choices: [],
-      usage: state.usage
+    events.push({
+      type: "response.output_text.delta",
+      output_index: state.messageOutputIndex,
+      content_index: 0,
+      delta
     });
   }
 
-  return chunks;
+  // Reasoning content
+  if (choice.delta?.reasoning_content) {
+    const delta = choice.delta.reasoning_content;
+    state.reasoningText += delta;
+    events.push({
+      type: "response.reasoning_summary_text.delta",
+      delta
+    });
+  }
+
+  // Tool calls
+  if (choice.delta?.tool_calls) {
+    for (const tc of choice.delta.tool_calls) {
+      if (tc.index === undefined) continue;
+
+      const hasId = !!tc.id;
+      const hasArgs = tc.function?.arguments !== undefined && tc.function.arguments !== "";
+
+      if (hasId) {
+        // New tool call declared
+        const outputIndex = state.nextOutputIndex++;
+        state.chatToolIndexToOutputIndex.set(tc.index, outputIndex);
+        state.toolCalls[tc.index] = {
+          id: tc.id,
+          name: tc.function?.name,
+          arguments: ""
+        };
+
+        events.push({
+          type: "response.output_item.added",
+          output_index: outputIndex,
+          item: {
+            type: "function_call",
+            call_id: tc.id,
+            name: tc.function?.name,
+            arguments: ""
+          }
+        });
+
+        // Some APIs send name and first arguments in the same chunk
+        if (tc.function?.arguments) {
+          state.toolCalls[tc.index].arguments = tc.function.arguments;
+          events.push({
+            type: "response.function_call_arguments.delta",
+            output_index: outputIndex,
+            delta: tc.function.arguments
+          });
+        }
+      } else if (hasArgs) {
+        // Arguments delta for existing tool call
+        const outputIndex = state.chatToolIndexToOutputIndex.get(tc.index);
+        if (outputIndex !== undefined) {
+          state.toolCalls[tc.index] = state.toolCalls[tc.index] ?? { id: "", name: "", arguments: "" };
+          state.toolCalls[tc.index].arguments += tc.function.arguments;
+          events.push({
+            type: "response.function_call_arguments.delta",
+            output_index: outputIndex,
+            delta: tc.function.arguments
+          });
+        }
+      }
+    }
+  }
+
+  // Finish
+  if (choice.finish_reason) {
+    if (chunk.usage) {
+      state.usage = chunk.usage;
+    }
+    state.finalized = true;
+    events.push(makeCompletedEvent(state, choice.finish_reason));
+  }
+
+  return events;
 }
 
-function makeDeltaChunk(
-  state: ChatStreamState,
-  delta: ChatChunkChoice["delta"]
-): ChatCompletionsChunk {
+function makeCreatedEvent(state: ChatToResponsesStreamState): ResponsesStreamEvent {
   return {
-    id: state.id,
-    object: "chat.completion.chunk",
-    created: state.created,
-    model: state.model,
-    choices: [
-      {
-        index: 0,
-        delta,
-        finish_reason: null
-      }
-    ]
+    type: "response.created",
+    response: {
+      id: state.id,
+      object: "response",
+      model: state.model,
+      status: "in_progress",
+      output: []
+    }
   };
 }
 
-function makeFinishChunk(
-  state: ChatStreamState,
+function makeMessageItemAddedEvent(outputIndex: number): ResponsesStreamEvent {
+  return {
+    type: "response.output_item.added",
+    output_index: outputIndex,
+    item: {
+      type: "message",
+      role: "assistant",
+      status: "in_progress",
+      content: []
+    }
+  };
+}
+
+function makeCompletedEvent(
+  state: ChatToResponsesStreamState,
   finishReason: string
-): ChatCompletionsChunk {
+): ResponsesStreamEvent {
+  const output: ResponsesOutput[] = [];
+
+  // Reasoning
+  if (state.reasoningText) {
+    output.push({
+      type: "reasoning",
+      summary: [{ type: "summary_text", text: state.reasoningText }]
+    });
+  }
+
+  // Text message
+  if (state.contentText && state.messageOutputIndex >= 0) {
+    output.push({
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: state.contentText }]
+    });
+  } else if (state.messageOutputIndex >= 0) {
+    // Message item was added but no text came (edge case)
+    output.push({
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: state.contentText }]
+    });
+  }
+
+  // Tool calls
+  for (let i = 0; i < state.toolCalls.length; i++) {
+    const tc = state.toolCalls[i];
+    if (tc) {
+      output.push({
+        type: "function_call",
+        call_id: tc.id,
+        name: tc.name,
+        arguments: tc.arguments || "{}"
+      });
+    }
+  }
+
+  const status = finishReasonToStatus(finishReason);
+  const incompleteDetails: { reason?: string } | undefined =
+    finishReason === "length" ? { reason: "max_output_tokens" } : undefined;
+
   return {
-    id: state.id,
-    object: "chat.completion.chunk",
-    created: state.created,
-    model: state.model,
-    choices: [
-      {
-        index: 0,
-        delta: {},
-        finish_reason: finishReason
-      }
-    ]
+    type: status === "completed" ? "response.completed" : `response.${status}`,
+    response: {
+      id: state.id,
+      object: "response",
+      model: state.model,
+      status,
+      output,
+      usage: state.usage ? mapChatUsageToResponsesUsage(state.usage) : undefined,
+      ...(incompleteDetails ? { incomplete_details: incompleteDetails } : {})
+    }
   };
 }
 
-async function streamResponsesToChat(
+async function streamChatToResponses(
   upstreamBody: ReadableStream<Uint8Array>,
-  requestedModel: string,
-  request: ChatCompletionsRequest,
+  model: string,
   ctx: ExecutionContext
 ): Promise<Response> {
-  const state = createStreamState(requestedModel, Boolean(request.stream_options?.include_usage));
+  const state = createResponsesStreamState(model);
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
 
@@ -932,36 +843,32 @@ async function streamResponsesToChat(
     (async () => {
       try {
         for await (const sse of iterateSseEvents(upstreamBody)) {
-          if (sse.data === "[DONE]") {
-            break;
-          }
+          if (sse.data === "[DONE]") break;
 
-          const event = parseResponsesStreamEvent(sse.data);
-          if (!event) {
-            continue;
-          }
+          const chunk = parseChatChunk(sse.data);
+          if (!chunk) continue;
 
-          const chunks = convertResponsesEventToChatChunks(event, state);
-          for (const chunk of chunks) {
-            await writer.write(encodeSseData(chunk));
+          const events = convertChatChunkToResponsesEvents(chunk, state);
+          for (const event of events) {
+            await writer.write(encodeResponsesSseEvent(event));
           }
         }
 
         if (!state.finalized) {
-          for (const chunk of finalizeStreamState(state)) {
-            await writer.write(encodeSseData(chunk));
+          for (const event of finalizeResponsesStreamState(state)) {
+            await writer.write(encodeResponsesSseEvent(event));
           }
         }
 
         await writer.write(encoder.encode("data: [DONE]\n\n"));
       } catch (error) {
         if (!state.finalized) {
-          for (const chunk of finalizeStreamState(state)) {
-            await writer.write(encodeSseData(chunk));
+          for (const event of finalizeResponsesStreamState(state)) {
+            await writer.write(encodeResponsesSseEvent(event));
           }
           await writer.write(encoder.encode("data: [DONE]\n\n"));
         }
-        console.error("streamResponsesToChat failed", error);
+        console.error("streamChatToResponses failed", error);
       } finally {
         await writer.close();
       }
@@ -978,106 +885,113 @@ async function streamResponsesToChat(
   });
 }
 
-async function collectChatCompletionFromStream(
+async function collectResponsesFromChatStream(
   upstreamBody: ReadableStream<Uint8Array>,
-  requestedModel: string,
-  includeUsage: boolean
-): Promise<ChatCompletionsResponse> {
-  const state = createStreamState(requestedModel, includeUsage);
-  let finalResponse: ResponsesResponse | undefined;
+  model: string
+): Promise<ResponsesResponse> {
+  const state = createResponsesStreamState(model);
+  let lastCompletionResponse: ChatCompletionsResponse | undefined;
 
   for await (const sse of iterateSseEvents(upstreamBody)) {
-    if (sse.data === "[DONE]") {
-      break;
+    if (sse.data === "[DONE]") break;
+
+    const chunk = parseChatChunk(sse.data);
+    if (!chunk) continue;
+
+    // Accumulate for building response
+    if (chunk.usage) {
+      state.usage = chunk.usage;
     }
 
-    const event = parseResponsesStreamEvent(sse.data);
-    if (!event) {
-      continue;
+    const choice = chunk.choices?.[0];
+    if (choice) {
+      if (!state.sentCreated) {
+        state.sentCreated = true;
+        state.id = chunk.id || state.id;
+        state.model = chunk.model || state.model;
+        state.created = chunk.created || state.created;
+      }
+      if (choice.delta?.content) {
+        state.contentText += choice.delta.content;
+        if (state.messageOutputIndex === -1) {
+          state.messageOutputIndex = state.nextOutputIndex++;
+        }
+      }
+      if (choice.delta?.reasoning_content) {
+        state.reasoningText += choice.delta.reasoning_content;
+      }
+      if (choice.delta?.tool_calls) {
+        for (const tc of choice.delta.tool_calls) {
+          if (tc.index === undefined) continue;
+          if (tc.id) {
+            state.chatToolIndexToOutputIndex.set(tc.index, state.nextOutputIndex++);
+            state.toolCalls[tc.index] = { id: tc.id, name: tc.function?.name, arguments: "" };
+          }
+          if (tc.function?.arguments && tc.index !== undefined) {
+            state.toolCalls[tc.index] = state.toolCalls[tc.index] ?? { id: "", name: "", arguments: "" };
+            state.toolCalls[tc.index].arguments += tc.function.arguments;
+          }
+        }
+      }
+      if (choice.finish_reason) {
+        state.finalized = true;
+        lastCompletionResponse = buildChatCompletionFromState(state, choice.finish_reason);
+      }
     }
-
-    if (
-      (event.type === "response.completed" ||
-        event.type === "response.incomplete" ||
-        event.type === "response.failed") &&
-      event.response
-    ) {
-      finalResponse = event.response;
-    }
-
-    convertResponsesEventToChatChunks(event, state);
   }
 
-  if (finalResponse) {
-    return responsesToChatCompletions(finalResponse, requestedModel);
+  if (lastCompletionResponse) {
+    return chatCompletionToResponsesResponse(lastCompletionResponse, model);
   }
 
-  return buildCompletionFromState(state);
+  return buildResponsesFromState(state, model);
 }
 
-function buildCompletionFromState(state: ChatStreamState): ChatCompletionsResponse {
+function buildChatCompletionFromState(
+  state: ChatToResponsesStreamState,
+  finishReason: string
+): ChatCompletionsResponse {
   const toolCalls: ChatToolCall[] = state.toolCalls
-    .map((toolCall, index) => ({
-      index,
-      id: toolCall.id,
-      type: "function",
-      function: {
-        name: toolCall.name,
-        arguments: toolCall.arguments
-      }
+    .map((tc, i) => ({
+      index: i,
+      id: tc.id,
+      type: "function" as const,
+      function: { name: tc.name, arguments: tc.arguments }
     }))
-    .filter((toolCall) => toolCall.function.name || toolCall.function.arguments);
+    .filter(tc => tc.function.name || tc.function.arguments);
 
-  const message: ChatChoice["message"] = {
-    role: "assistant"
-  };
-  if (state.contentText) {
-    message.content = state.contentText;
-  }
-  if (state.reasoningText) {
-    message.reasoning_content = state.reasoningText;
-  }
-  if (toolCalls.length > 0) {
-    message.tool_calls = toolCalls;
-  }
+  const message: ChatChoice["message"] = { role: "assistant" };
+  if (state.contentText) message.content = state.contentText;
+  if (state.reasoningText) message.reasoning_content = state.reasoningText;
+  if (toolCalls.length > 0) message.tool_calls = toolCalls;
 
   return {
     id: state.id,
     object: "chat.completion",
-    created: state.created,
+    created: state.created || Math.floor(Date.now() / 1000),
     model: state.model,
-    choices: [
-      {
-        index: 0,
-        message,
-        finish_reason: state.finishReason || (toolCalls.length > 0 ? "tool_calls" : "stop")
-      }
-    ],
+    choices: [{ index: 0, message, finish_reason: finishReason }],
     usage: state.usage
   };
 }
 
-function finalizeStreamState(state: ChatStreamState): ChatCompletionsChunk[] {
-  if (state.finalized) {
-    return [];
-  }
-
-  state.finalized = true;
-  state.finishReason = state.sawToolCall ? "tool_calls" : "stop";
-
-  const chunks: ChatCompletionsChunk[] = [makeFinishChunk(state, state.finishReason)];
-  if (state.includeUsage && state.usage) {
-    chunks.push({
-      id: state.id,
-      object: "chat.completion.chunk",
-      created: state.created,
-      model: state.model,
-      choices: [],
-      usage: state.usage
-    });
-  }
-  return chunks;
+function buildResponsesFromState(
+  state: ChatToResponsesStreamState,
+  model: string
+): ResponsesResponse {
+  return chatCompletionToResponsesResponse(
+    buildChatCompletionFromState(state, state.finalized ? "stop" : "stop"),
+    model
+  );
 }
+
+function finalizeResponsesStreamState(state: ChatToResponsesStreamState): ResponsesStreamEvent[] {
+  if (state.finalized) return [];
+  state.finalized = true;
+  return [makeCompletedEvent(state, "stop")];
+}
+
+// ========== SSE utilities ==========
 
 async function* iterateSseEvents(
   stream: ReadableStream<Uint8Array>
@@ -1089,48 +1003,38 @@ async function* iterateSseEvents(
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
+      if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
       buffer = buffer.replace(/\r\n/g, "\n");
 
-      let boundaryIndex = buffer.indexOf("\n\n");
-      while (boundaryIndex !== -1) {
-        const rawEvent = buffer.slice(0, boundaryIndex);
-        buffer = buffer.slice(boundaryIndex + 2);
+      let idx = buffer.indexOf("\n\n");
+      while (idx !== -1) {
+        const rawEvent = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
         const event = parseSseEvent(rawEvent);
-        if (event) {
-          yield event;
-        }
-        boundaryIndex = buffer.indexOf("\n\n");
+        if (event) yield event;
+        idx = buffer.indexOf("\n\n");
       }
     }
 
     buffer += decoder.decode();
     buffer = buffer.replace(/\r\n/g, "\n");
     const event = parseSseEvent(buffer);
-    if (event) {
-      yield event;
-    }
+    if (event) yield event;
   } finally {
     reader.releaseLock();
   }
 }
 
 function parseSseEvent(rawEvent: string): { event: string; data: string } | null {
-  if (!rawEvent.trim()) {
-    return null;
-  }
+  if (!rawEvent.trim()) return null;
 
   let eventName = "message";
   const dataLines: string[] = [];
 
   for (const line of rawEvent.split("\n")) {
-    if (!line || line.startsWith(":")) {
-      continue;
-    }
+    if (!line || line.startsWith(":")) continue;
     if (line.startsWith("event:")) {
       eventName = line.slice(6).trim() || "message";
       continue;
@@ -1140,236 +1044,93 @@ function parseSseEvent(rawEvent: string): { event: string; data: string } | null
     }
   }
 
-  if (dataLines.length === 0) {
-    return null;
-  }
-
-  return {
-    event: eventName,
-    data: dataLines.join("\n")
-  };
+  if (dataLines.length === 0) return null;
+  return { event: eventName, data: dataLines.join("\n") };
 }
 
-function parseResponsesStreamEvent(data: string): ResponsesStreamEvent | null {
+function parseChatChunk(data: string): ChatCompletionsChunk | null {
   try {
-    return JSON.parse(data) as ResponsesStreamEvent;
+    return JSON.parse(data) as ChatCompletionsChunk;
   } catch {
     return null;
   }
 }
 
-function encodeSseData(payload: ChatCompletionsChunk): Uint8Array {
-  return encoder.encode(`data: ${JSON.stringify(payload)}\n\n`);
+function encodeResponsesSseEvent(event: ResponsesStreamEvent): Uint8Array {
+  const eventName = event.type;
+  const data = JSON.stringify(event);
+  return encoder.encode(`event: ${eventName}\ndata: ${data}\n\n`);
 }
 
-function mapUsage(usage: ResponsesUsage): ChatUsage {
+// ========== Field mapping ==========
+
+function mapChatUsageToResponsesUsage(usage: ChatUsage): ResponsesUsage {
   return {
-    prompt_tokens: usage.input_tokens,
-    completion_tokens: usage.output_tokens,
+    input_tokens: usage.prompt_tokens,
+    output_tokens: usage.completion_tokens,
     total_tokens: usage.total_tokens,
-    prompt_tokens_details:
-      usage.input_tokens_details?.cached_tokens !== undefined
-        ? {
-            cached_tokens: usage.input_tokens_details.cached_tokens
-          }
+    input_tokens_details:
+      usage.prompt_tokens_details?.cached_tokens !== undefined
+        ? { cached_tokens: usage.prompt_tokens_details.cached_tokens }
         : undefined
   };
 }
 
-function responsesStatusToFinishReason(
-  status: string,
-  incompleteReason: string | undefined,
-  sawToolCall: boolean
-): string {
-  if (status === "incomplete" && incompleteReason === "max_output_tokens") {
-    return "length";
+function finishReasonToStatus(reason: string): string {
+  switch (reason) {
+    case "stop":
+    case "tool_calls":
+      return "completed";
+    case "length":
+      return "incomplete";
+    default:
+      return "completed";
   }
-  if (status === "completed" && sawToolCall) {
-    return "tool_calls";
-  }
-  if (status === "failed") {
-    return "stop";
-  }
-  return sawToolCall ? "tool_calls" : "stop";
 }
 
-async function convertUpstreamErrorResponse(response: Response): Promise<Response> {
-  const fallbackType = mapStatusToOpenAIErrorType(response.status);
-  const fallbackMessage = `Upstream request failed with status ${response.status}`;
+// ========== Content extraction helpers ==========
 
-  let payload: unknown;
-  try {
-    payload = await response.clone().json();
-  } catch {
-    payload = undefined;
-  }
+function extractTextFromContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
 
-  if (isRecord(payload)) {
-    if (isRecord(payload.error)) {
-      const message =
-        typeof payload.error.message === "string" ? payload.error.message : fallbackMessage;
-      const type =
-        typeof payload.error.type === "string" ? payload.error.type : fallbackType;
-      const code =
-        typeof payload.error.code === "string" ? payload.error.code : undefined;
-      return openAIErrorResponse(response.status, type, message, code);
-    }
-
-    const message = typeof payload.message === "string" ? payload.message : fallbackMessage;
-    const code = typeof payload.code === "string" ? payload.code : undefined;
-    return openAIErrorResponse(response.status, fallbackType, message, code);
-  }
-
-  const text = await response.text();
-  return openAIErrorResponse(response.status, fallbackType, text || fallbackMessage);
-}
-
-function getUpstreamBaseUrl(env: Env): string {
-  return (env.UPSTREAM_BASE_URL?.trim() || DEFAULT_UPSTREAM_BASE_URL).replace(/\/+$/, "");
-}
-
-function joinUrl(baseUrl: string, path: string): string {
-  return `${baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
-}
-
-function buildUpstreamHeaders(request: Request): Headers {
-  const headers = new Headers();
-  headers.set("content-type", "application/json");
-  headers.set("accept", "application/json, text/event-stream");
-  const authorization = request.headers.get("authorization");
-  const xApiKey = request.headers.get("x-api-key");
-  const xGoogApiKey = request.headers.get("x-goog-api-key");
-
-  if (authorization) {
-    headers.set("authorization", authorization);
-  }
-  if (xApiKey) {
-    headers.set("x-api-key", xApiKey);
-  }
-  if (xGoogApiKey) {
-    headers.set("x-goog-api-key", xGoogApiKey);
-  }
-
-  headers.set("user-agent", request.headers.get("user-agent") || "hypergryph-openai-compat-proxy/0.1.0");
-  return headers;
-}
-
-function coerceAssistantText(message: ChatMessage): string {
   const parts: string[] = [];
-
-  if (message.reasoning_content) {
-    parts.push(`<thinking>${message.reasoning_content}</thinking>`);
-  }
-
-  if (typeof message.content === "string") {
-    parts.push(message.content);
-    return parts.join("");
-  }
-
-  if (!Array.isArray(message.content)) {
-    if (message.content !== undefined && message.content !== null) {
-      parts.push(coerceText(message.content));
-    }
-    return parts.join("");
-  }
-
-  for (const rawPart of message.content as ChatContentPart[]) {
-    if (!isRecord(rawPart) || typeof rawPart.type !== "string") {
-      continue;
-    }
-
-    if (
-      (rawPart.type === "text" ||
-        rawPart.type === "input_text" ||
-        rawPart.type === "output_text") &&
-      typeof rawPart.text === "string"
-    ) {
-      parts.push(rawPart.text);
-      continue;
-    }
-
-    if (rawPart.type === "thinking" || rawPart.type === "reasoning") {
-      const thinkingText =
-        typeof rawPart.thinking === "string"
-          ? rawPart.thinking
-          : typeof rawPart.text === "string"
-            ? rawPart.text
-            : "";
-      if (thinkingText) {
-        parts.push(`<thinking>${thinkingText}</thinking>`);
-      }
+  for (const p of content as ResponsesContentPart[]) {
+    if ((p.type === "output_text" || p.type === "input_text") && typeof p.text === "string") {
+      parts.push(p.text);
     }
   }
-
   return parts.join("");
 }
 
-function coerceText(content: unknown): string {
-  if (typeof content === "string") {
-    return content;
-  }
+function coerceInputContent(content: unknown): string | ChatContentPart[] {
+  if (typeof content === "string") return content;
 
-  if (Array.isArray(content)) {
-    const textParts: string[] = [];
-    for (const item of content as ChatContentPart[]) {
-      if (!isRecord(item) || typeof item.type !== "string") {
-        continue;
-      }
-      const recordItem = item as Record<string, unknown>;
-      const thinking =
-        typeof recordItem.thinking === "string" ? recordItem.thinking : undefined;
-      if (
-        (item.type === "text" ||
-          item.type === "input_text" ||
-          item.type === "output_text" ||
-          item.type === "reasoning" ||
-          item.type === "thinking") &&
-        (typeof item.text === "string" || typeof thinking === "string")
-      ) {
-        textParts.push(
-          typeof item.text === "string"
-            ? item.text
-            : typeof thinking === "string"
-              ? thinking
-              : ""
-        );
-      }
+  if (!Array.isArray(content)) return typeof content === "object" && content !== null
+    ? JSON.stringify(content)
+    : String(content ?? "");
+
+  const parts: ChatContentPart[] = [];
+  for (const p of content as ResponsesContentPart[]) {
+    if (p.type === "input_text" && typeof p.text === "string") {
+      parts.push({ type: "text", text: p.text });
+    } else if (p.type === "input_image" && typeof p.image_url === "string") {
+      parts.push({ type: "image_url", image_url: p.image_url });
     }
-    return textParts.join("");
   }
 
-  if (content === null || content === undefined) {
-    return "";
-  }
-
-  try {
-    return JSON.stringify(content);
-  } catch {
-    return String(content);
-  }
+  return parts.length > 0 ? parts : "";
 }
 
-function extractImageUrl(imageUrl: unknown): string | null {
-  if (typeof imageUrl === "string" && imageUrl) {
-    return imageUrl;
-  }
-  if (isRecord(imageUrl) && typeof imageUrl.url === "string" && imageUrl.url) {
-    return imageUrl.url;
-  }
-  return null;
-}
+// ========== CORS ==========
 
 function buildOptionsResponse(request: Request, env: Env): Response {
-  return new Response(null, {
-    status: 204,
-    headers: buildCorsHeaders(request, env)
-  });
+  return new Response(null, { status: 204, headers: buildCorsHeaders(request, env) });
 }
 
 function withCors(response: Response, request: Request, env: Env): Response {
   const headers = new Headers(response.headers);
   buildCorsHeaders(request, env).forEach((value, key) => headers.set(key, value));
-
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -1385,12 +1146,8 @@ function buildCorsHeaders(request: Request, env: Env): Headers {
   if (configured === "*") {
     headers.set("access-control-allow-origin", "*");
   } else {
-    const allowedOrigins = configured
-      .split(",")
-      .map((origin) => origin.trim())
-      .filter(Boolean);
-    const origin =
-      requestOrigin && allowedOrigins.includes(requestOrigin) ? requestOrigin : allowedOrigins[0];
+    const allowed = configured.split(",").map(o => o.trim()).filter(Boolean);
+    const origin = requestOrigin && allowed.includes(requestOrigin) ? requestOrigin : allowed[0];
     if (origin) {
       headers.set("access-control-allow-origin", origin);
       headers.append("vary", "Origin");
@@ -1403,13 +1160,33 @@ function buildCorsHeaders(request: Request, env: Env): Headers {
   return headers;
 }
 
-function jsonResponse(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8"
+// ========== Error handling ==========
+
+async function convertUpstreamErrorResponse(response: Response): Promise<Response> {
+  const fallbackType = mapStatusToOpenAIErrorType(response.status);
+  const fallbackMessage = `Upstream request failed with status ${response.status}`;
+
+  let payload: unknown;
+  try {
+    payload = await response.clone().json();
+  } catch {
+    payload = undefined;
+  }
+
+  if (isRecord(payload)) {
+    if (isRecord(payload.error)) {
+      const message = typeof payload.error.message === "string" ? payload.error.message : fallbackMessage;
+      const type = typeof payload.error.type === "string" ? payload.error.type : fallbackType;
+      const code = typeof payload.error.code === "string" ? payload.error.code : undefined;
+      return openAIErrorResponse(response.status, type, message, code);
     }
-  });
+    const message = typeof payload.message === "string" ? payload.message : fallbackMessage;
+    const code = typeof payload.code === "string" ? payload.code : undefined;
+    return openAIErrorResponse(response.status, fallbackType, message, code);
+  }
+
+  const text = await response.text();
+  return openAIErrorResponse(response.status, fallbackType, text || fallbackMessage);
 }
 
 function openAIErrorResponse(
@@ -1419,39 +1196,56 @@ function openAIErrorResponse(
   code?: string
 ): Response {
   return jsonResponse(
-    {
-      error: {
-        message,
-        type,
-        param: null,
-        code: code ?? null
-      }
-    },
+    { error: { message, type, param: null, code: code ?? null } },
     status
   );
 }
 
 function mapStatusToOpenAIErrorType(status: number): string {
-  if (status === 400) {
-    return "invalid_request_error";
-  }
-  if (status === 401 || status === 403) {
-    return "authentication_error";
-  }
-  if (status === 429) {
-    return "rate_limit_error";
-  }
+  if (status === 400) return "invalid_request_error";
+  if (status === 401 || status === 403) return "authentication_error";
+  if (status === 429) return "rate_limit_error";
   return "api_error";
 }
 
-function generateChatCompletionId(): string {
-  return `chatcmpl-${crypto.randomUUID().replace(/-/g, "")}`;
+// ========== General utilities ==========
+
+function getUpstreamBaseUrl(env: Env): string {
+  return (env.UPSTREAM_BASE_URL?.trim() || DEFAULT_UPSTREAM_BASE_URL).replace(/\/+$/, "");
 }
 
-function isTrue(value: string | undefined): boolean {
-  return value === "1" || value === "true" || value === "TRUE";
+function joinUrl(baseUrl: string, path: string): string {
+  return `${baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
-function isRecord(value: unknown): value is Record<string, any> {
+function buildUpstreamHeaders(request: Request): Headers {
+  const headers = new Headers();
+  headers.set("content-type", "application/json");
+  headers.set("accept", "application/json, text/event-stream");
+
+  const authorization = request.headers.get("authorization");
+  const xApiKey = request.headers.get("x-api-key");
+  const xGoogApiKey = request.headers.get("x-goog-api-key");
+
+  if (authorization) headers.set("authorization", authorization);
+  if (xApiKey) headers.set("x-api-key", xApiKey);
+  if (xGoogApiKey) headers.set("x-goog-api-key", xGoogApiKey);
+
+  headers.set("user-agent", request.headers.get("user-agent") || "responses2deepseek-proxy/0.2.0");
+  return headers;
+}
+
+function jsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" }
+  });
+}
+
+function generateId(prefix: string): string {
+  return `${prefix}-${crypto.randomUUID().replace(/-/g, "")}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
